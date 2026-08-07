@@ -1,29 +1,67 @@
-﻿// Problem class represents an HTTP problem response with a status code, error code, and title
-internal sealed class Problem(int status, string code, string title) : Exception(title)
+﻿namespace Ledger.Api;
+
+// Problem class represents an HTTP problem response with a status code, error code, and title
+internal sealed class Problem(int status, string type, string title, string detail) : Exception(detail)
 {
     public int Status { get; } = status;
-    public string Code { get; } = code;
-    public string Title => Message;
-    public static Problem Invalid(string title) =>
-        new(400, "invalid_request", title);
+    public string Type { get; } = type;
+    public string Title { get; } = title;
+    public string Detail => Message;
+    public static Problem Invalid(string detail) =>
+        new(
+            400,
+            "/problems/invalid-request",
+            "Invalid request",
+            detail);
     public static Problem AccountNotFound() =>
-        new(404, "account_not_found", "Account not found");
+        new(
+            404,
+            "/problems/account-not-found",
+            "Account not found",
+            "The requested account does not exist");
     public static Problem TransferNotFound() =>
-        new(404, "transfer_not_found", "Transfer not found");
+        new(404,
+            "/problems/transfer-not-found",
+            "Transfer not found",
+            "The requested transfer does not exist");
     public static Problem AccountConflict() =>
-        new(409, "account_conflict", "Account ID already exists");
+        new(409,
+            "/problems/account-conflict",
+            "Account conflict",
+            "An account with this ID already exists");
     public static Problem IdempotencyConflict() =>
-        new(409, "idempotency_conflict", "Idempotency key was already used for a different request");
+        new(409,
+            "/problems/idempotency-conflict",
+            "Idempotency conflict",
+            "The provided idempotency key has already been used for a different request");
     public static Problem AlreadyReversed() =>
-        new(409, "already_reversed", "A transfer can only be reversed once");
+        new(409,
+            "/problems/already-reversed",
+            "Transfer already reversed",
+            "The requested transfer has already been reversed");
     public static Problem NotReversible() =>
-        new(409, "not_reversible", "Transfer is not reversible");
+        new(409,
+            "/problems/not-reversible",
+            "Transfer is not reversible",
+            "The requested transfer cannot be reversed");
     public static Problem CurrencyMismatch() =>
-        new(422, "currency_mismatch", "Currency mismatch");
+        new(422,
+            "/problems/currency-mismatch",
+            "Currency mismatch",
+            "The currencies of the source and destination accounts do not match");
     public static Problem InsufficientFunds() =>
-        new(422, "insufficient_funds", "Account has insufficient funds");
+        new(422,
+            "/problems/insufficient-funds",
+            "Insufficient funds",
+            "The requested account has insufficient funds");
     public static Problem BalanceLimit() =>
-        new(422, "balance_limit_exceeded", "Account balance limit exceeded");
+        new(422,
+            "/problems/balance-limit-exceeded",
+            "Balance limit exceeded",
+            "The requested account has exceeded its balance limit");
     public static Problem DatabaseUnavailable() =>
-        new(503, "database_unavailable", "Database is unavailable");
+        new(503,
+            "/problems/database-unavailable",
+            "Database unavailable",
+            "The ledger database cannot be reached");
 }

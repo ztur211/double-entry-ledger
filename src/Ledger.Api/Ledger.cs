@@ -1,4 +1,6 @@
-﻿// Ledger class for health check
+﻿namespace Ledger.Api;
+
+// Ledger class for health check
 using Npgsql;
 internal static class Ledger
 {

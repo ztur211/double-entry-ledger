@@ -1,6 +1,6 @@
 ﻿namespace Ledger.Api;
 
-// Problem class represents an HTTP problem response with a status code, error code, and title
+// Represents an HTTP problem response with a status, type, title, and detail
 internal sealed class Problem(int status, string type, string title, string detail) : Exception(detail)
 {
     public int Status { get; } = status;
@@ -42,7 +42,7 @@ internal sealed class Problem(int status, string type, string title, string deta
     public static Problem NotReversible() =>
         new(409,
             "/problems/not-reversible",
-            "Transfer is not reversible",
+            "Transfer not reversible",
             "The requested transfer cannot be reversed");
     public static Problem CurrencyMismatch() =>
         new(422,

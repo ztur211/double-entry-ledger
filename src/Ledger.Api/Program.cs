@@ -30,7 +30,7 @@ public class Program
         // Run once during startup before requests hit API
         await Ledger.EnsureSchemaAsync(db);
 
-        // Endpoints and Ledger methods to throw Problem
+        // Convert expected endpoint and ledger failures into problem responses
         app.Use(async (context, next) =>
         {
             try
@@ -144,6 +144,50 @@ public class Program
         static bool IsCurrency(string? currency) =>
             currency is { Length: 3 } && currency.All(letter => letter is >= 'A' and <= 'Z');
 
+        // POST /transfers creates transfer or handles identical retry
+        // Return 201 for new transfer, 200 for identical retry
+        // Return 400 for invalid input, 404 for missing account
+        // Return 409 for idempotency conflict, 422 if movement is rejected
+        app.MapPost("/transfers", async (HttpRequest http, CreateTransferRequest request) =>
+        {
+            string key = RequireKey(http);
+            if (request.SourceAccountId == Guid.Empty ||
+                request.DestinationAccountId == Guid.Empty ||
+                request.SourceAccountId == request.DestinationAccountId ||
+                request.AmountMinor <= 0)
+            {
+                throw Problem.Invalid("Transfer accounts or amount are invalid");
+            }
+
+            var (transfer, created) = await Ledger.CreateTransferAsync(
+                db,
+                key,
+                request.SourceAccountId,
+                request.DestinationAccountId,
+                request.AmountMinor);
+            return created
+                ? Results.Created($"/transfers/{transfer.Id:D}", transfer.ToResponse())
+                : Results.Ok(transfer.ToResponse());
+        });
+
+        // GET /transfers/{id} returns an existing transfer
+        // Return 200 with transfer details
+        // Return 400 for invalid ID, 404 if transfer does not exist
+        app.MapGet("/transfers/{id}", async (string id) =>
+            Results.Ok((await Ledger.GetTransferAsync(db, ParseId(id, "Transfer"))).ToResponse()));
+        
+        // Require one ASCII idempotency key
+        static string RequireKey(HttpRequest request)
+        {
+            request.Headers.TryGetValue("Idempotency-Key", out var values);
+            string? key = values.Count == 1 ? values[0] : null;
+            if (key is null || key.Length is 0 or > 128 || key.Any(c => c is < '!' or > '~'))
+            {
+                throw Problem.Invalid("Exactly one Idempotency-Key header of 1 to 128 visible ASCII characters is required");
+            }
+            return key;
+        }
+
         await app.RunAsync();
     }
 }
@@ -152,3 +196,5 @@ internal sealed record HealthResponse(string Status);
 internal sealed record CreateAccountRequest(Guid Id, string? Currency, long OpeningBalanceMinor);
 internal sealed record AccountResponse(Guid Id, string Currency, long OpeningBalanceMinor);
 internal sealed record BalanceResponse(Guid Id, string Currency, long BalanceMinor);
+internal sealed record CreateTransferRequest(Guid SourceAccountId, Guid DestinationAccountId, long AmountMinor);
+internal sealed record TransferResponse(Guid Id, string Type, Guid? SourceAccountId, Guid DestinationAccountId, long AmountMinor, string Currency, Guid? ReversalOf);

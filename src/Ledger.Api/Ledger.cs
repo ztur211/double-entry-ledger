@@ -4,7 +4,7 @@ using NpgsqlTypes;
 
 namespace Ledger.Api;
 
-// Ledger class for health check
+// Database operations for health, accounts, balances, transfers, postings
 internal static class Ledger
 {
     // DB health check
@@ -28,7 +28,7 @@ internal static class Ledger
         CREATE TABLE IF NOT EXISTS accounts (
             id UUID PRIMARY KEY,
             currency TEXT NOT NULL CHECK (currency ~ '^[A-Z]{3}$'),
-            -- Original balance is the sum of all transactions
+            -- opening_minor is the immutable original opening balance
             opening_minor bigint NOT NULL CHECK (opening_minor >= 0),
             balance_minor numeric(30, 0) NOT NULL,
             is_system boolean NOT NULL,
@@ -36,7 +36,7 @@ internal static class Ledger
             CHECK (is_system OR (balance_minor >= 0 AND balance_minor <= 9223372036854775807))
         );
 
-        -- One account per currency
+        -- Exactly one hidden system equity account per currency
         CREATE UNIQUE INDEX IF NOT EXISTS unique_account_currency
             ON accounts(currency) WHERE is_system;
 
@@ -55,7 +55,8 @@ internal static class Ledger
             CHECK ((kind = 'reversal') = (reversal_of IS NOT NULL))
         );
 
-        -- Postings are the double entry, amounts sum to zero, transfers write two rows
+        -- Postings store the double entry
+        -- Application code writes two equal and opposite rows per transfer
         CREATE TABLE IF NOT EXISTS postings (
             sequence bigint GENERATED ALWAYS AS IDENTITY UNIQUE,
             id UUID PRIMARY KEY,
@@ -72,6 +73,15 @@ internal static class Ledger
 
         -- Create index for faster queries
         CREATE INDEX IF NOT EXISTS postings_account_sequence_idx ON postings(account_id, sequence);
+
+        -- Idempotency key table for transfer requests
+        CREATE TABLE IF NOT EXISTS idempotency_keys (
+            key text PRIMARY KEY CHECK (
+                octet_length(key) BETWEEN 1 AND 128 AND key !~ '[[:space:][:cntrl:]]'
+            ),
+            request text NOT NULL,
+            transfer_id uuid UNIQUE REFERENCES transfers(id)
+        );
     """;
 
     // Initialize the database schema
@@ -142,7 +152,8 @@ internal static class Ledger
                 return (new AccountResponse(id, currency, openingMinor), false);
             }
 
-            // Positive opening balance is required for new accounts
+            // Positive opening balance creates balanced opening movement
+            // Zero opening balance creates no movement
             if (openingMinor > 0)
             {
                 Guid equityId = await EquityAccountAsync(connection, transaction, currency);
@@ -168,10 +179,12 @@ internal static class Ledger
         {
             throw Problem.AccountNotFound();
         }
-        return new BalanceResponse(id, reader.GetString(0), decimal.ToInt64(reader.GetDecimal(1)));
+
+        // PostgreSQL bigint maps to C# long, which is signed 64-bit integer
+        return new BalanceResponse(id, reader.GetString(0), reader.GetInt64(1));
     }
 
-    // One hidden equity account per currency, used for opening balances and reversals
+    // One hidden equity account per currency, used for opening balances
     // Invisible through API
     private static async Task<Guid> EquityAccountAsync(NpgsqlConnection connection, NpgsqlTransaction transaction, string currency)
     {
@@ -197,7 +210,7 @@ internal static class Ledger
         return (Guid)(await select.ExecuteScalarAsync() ?? throw new InvalidOperationException("Equity account not created"));
     }
 
-    // Writes an immutable transfer and its two postings, updates balances, and returns the transfer
+    // Writes an immutable transfer and its two postings, updates balances
     private static async Task InsertMovementAsync(NpgsqlConnection connection, NpgsqlTransaction transaction, Transfer transfer)
     {
         await using var cmd = Command(connection, transaction,
@@ -244,14 +257,201 @@ internal static class Ledger
         cmd.CommandText = sql;
         return cmd;
     }
-}
 
-// Storage shape of transfer row
-internal sealed record Transfer(
-    Guid Id,
-    string Kind,
-    Guid SourceId,
-    Guid DestinationId,
-    long AmountMinor,
-    string Currency,
-    Guid? ReversalOf);
+    public static async Task<Transfer> GetTransferAsync(NpgsqlDataSource db, Guid id)
+    {
+        await using var connection = await db.OpenConnectionAsync();
+        return await ReadTransferAsync(connection, null, id)
+            ?? throw Problem.TransferNotFound();
+    }
+
+    private static async Task<(AccountState Source, AccountState Destination)> LockAccountsAsync(NpgsqlConnection connection, NpgsqlTransaction transaction, Guid sourceId, Guid destinationId)
+    {
+        await using var cmd = Command(connection, transaction,
+            """
+            SELECT id, currency, balance_minor::bigint
+            FROM accounts
+            WHERE (id = @source OR id = @destination) AND NOT is_system
+            ORDER BY id
+            FOR UPDATE;
+            """);
+        cmd.Parameters.AddWithValue("source", sourceId);
+        cmd.Parameters.AddWithValue("destination", destinationId);
+
+        AccountState? source = null;
+        AccountState? destination = null;
+        await using var reader = await cmd.ExecuteReaderAsync();
+        while (await reader.ReadAsync())
+        {
+            var state = new AccountState(reader.GetString(1), reader.GetInt64(2));
+
+            if (reader.GetGuid(0) == sourceId)
+            {
+                source = state;
+            }
+            else
+            {
+                destination = state;
+            }
+        }
+        if (source is null || destination is null)
+        {
+            throw Problem.AccountNotFound();
+        }
+        return (source, destination);
+    }
+
+    private static void ValidateMovement(AccountState source, AccountState destination, long amountMinor)
+    {
+        if (source.Currency != destination.Currency)
+        {
+            throw Problem.CurrencyMismatch();
+        }
+        if (source.BalanceMinor < amountMinor)
+        {
+            throw Problem.InsufficientFunds();
+        }
+        if (destination.BalanceMinor > long.MaxValue - amountMinor)
+        {
+            throw Problem.BalanceLimit();
+        }
+    }
+
+    private static async Task<Transfer?> ReadTransferAsync(NpgsqlConnection connection, NpgsqlTransaction? transaction, Guid id)
+    {
+        await using var cmd = Command(connection, transaction,
+            """
+            SELECT id, kind, source_id, destination_id, amount_minor::bigint, currency, reversal_of
+            FROM transfers
+            WHERE id = @id;
+            """);
+        cmd.Parameters.AddWithValue("id", id);
+        await using var reader = await cmd.ExecuteReaderAsync();
+        if (!await reader.ReadAsync())
+        {
+            return null;
+        }
+        return new Transfer(
+            reader.GetGuid(0),
+            reader.GetString(1),
+            reader.GetGuid(2),
+            reader.GetGuid(3),
+            reader.GetInt64(4),
+            reader.GetString(5),
+            reader.IsDBNull(6) ? null : reader.GetGuid(6)
+        );
+    }
+
+    // Claim and complete a key
+    private static async Task<Transfer?> ClaimKeyAsync(NpgsqlConnection connection, NpgsqlTransaction transaction, string key, string request)
+    {
+        await using (var insert = Command(connection, transaction,
+            """
+            INSERT INTO idempotency_keys (key, request, transfer_id)
+            VALUES (@key, @request, NULL)
+            ON CONFLICT DO NOTHING
+            RETURNING key;
+            """))
+        {
+            insert.Parameters.AddWithValue("key", key);
+            insert.Parameters.AddWithValue("request", request);
+            if (await insert.ExecuteScalarAsync() is not null)
+            {
+                return null;
+            }
+        }
+
+        await using var select = Command(connection, transaction,
+            """
+            SELECT request, transfer_id
+            FROM idempotency_keys
+            WHERE key = @key;
+            """);
+        select.Parameters.AddWithValue("key", key);
+
+        string storedRequest;
+        Guid transferId;
+        await using (var reader = await select.ExecuteReaderAsync())
+        {
+            if (!await reader.ReadAsync())
+            {
+                throw new InvalidOperationException("Idempotency key not found after insert");
+            }
+
+            storedRequest = reader.GetString(0);
+            transferId = reader.IsDBNull(1)
+                ? throw new InvalidOperationException("Idempotency key has no transfer")
+                : reader.GetGuid(1);
+        }
+
+        if (storedRequest != request)
+        {
+            throw Problem.IdempotencyConflict();
+        }
+        return await ReadTransferAsync(connection, transaction, transferId)
+            ?? throw new InvalidOperationException("Idempotency key references a missing transfer");
+    }
+
+    private static async Task LinkKeyAsync(NpgsqlConnection connection, NpgsqlTransaction transaction, string key, Guid transferId)
+    {
+        await using var cmd = Command(connection, transaction,
+            """
+            UPDATE idempotency_keys
+            SET transfer_id = @transfer
+            WHERE key = @key AND transfer_id IS NULL;
+            """);
+        cmd.Parameters.AddWithValue("key", key);
+        cmd.Parameters.AddWithValue("transfer", transferId);
+        int affected = await cmd.ExecuteNonQueryAsync();
+        if (affected != 1)
+        {
+            throw new InvalidOperationException("Idempotency claim could not be completed");
+        }
+    }
+
+    // Storage shape of transfer row
+    internal sealed record Transfer(
+        Guid Id,
+        string Kind,
+        Guid SourceId,
+        Guid DestinationId,
+        long AmountMinor,
+        string Currency,
+        Guid? ReversalOf)
+    {
+        public TransferResponse ToResponse() =>
+            new(
+                Id,
+                Kind,
+                Kind == "opening" ? null : SourceId,
+                DestinationId,
+                AmountMinor,
+                Currency,
+                ReversalOf);
+    }
+
+    public static async Task<(Transfer Transfer, bool Created)> CreateTransferAsync(NpgsqlDataSource db, string key, Guid sourceId, Guid destinationId, long amountMinor)
+    {
+        await using var connection = await db.OpenConnectionAsync();
+        await using var transaction = await connection.BeginTransactionAsync(IsolationLevel.ReadCommitted);
+        string request = FormattableString.Invariant($"transfer:{sourceId:D}:{destinationId:D}:{amountMinor}");
+        Transfer? replay = await ClaimKeyAsync(connection, transaction, key, request);
+        if (replay is not null)
+        {
+            await transaction.CommitAsync();
+            return (replay, false);
+        }
+
+        var (source, destination) = await LockAccountsAsync(connection, transaction, sourceId, destinationId);
+        ValidateMovement(source, destination, amountMinor);
+
+        var transfer = new Transfer(
+            Guid.NewGuid(), "transfer", sourceId, destinationId, amountMinor, source.Currency, null);
+        await InsertMovementAsync(connection, transaction, transfer);
+        await LinkKeyAsync(connection, transaction, key, transfer.Id);
+
+        await transaction.CommitAsync();
+        return (transfer, true);
+    }
+}
+internal sealed record AccountState(string Currency, long BalanceMinor);
